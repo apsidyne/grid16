@@ -1,0 +1,755 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>画像グリッド</title>
+
+  <script defer src="https://cdn.jsdelivr.net/npm/pica@9.0.1/dist/pica.min.js" integrity="sha384-erKD4aAW95PJjutWX+eFrsIh9Kl6k9mLJ89rDrWhF2/EvCdxqe2aR5tDaI4SIFl/" crossorigin="anonymous"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/heic2any@0.0.4/dist/heic2any.min.js" integrity="sha384-OTofQ0MEeiSgh62havBcemCIK0gqj809wX6UA0uPISNMRnR6NZyCdGzX3SbLrgwL" crossorigin="anonymous"></script>
+  <style>
+    :root { color-scheme: light; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    body { margin: 24px; color: #1f2937; background: #f8fafc; }
+    main { max-width: 960px; margin: auto; }
+    h1 { font-size: 1.35rem; margin: 0 0 8px; }
+    .help, #status { margin: 0 0 16px; font-size: .9rem; }
+    #status { min-height: 1.4em; color: #075985; white-space: pre-line; }
+    #status.error { color: #b91c1c; }
+    #grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+    .cell { position: relative; aspect-ratio: 1; min-width: 0; box-sizing: border-box; display: flex; flex-direction: column; align-items: center; justify-content: center; overflow: hidden; padding: 8px; border: 2px dashed #94a3b8; border-radius: 8px; background: #fff; transition: border-color .12s, background .12s, transform .12s; }
+    .cell.dragover { border-color: #0369a1; background: #e0f2fe; transform: scale(1.015); }
+    @keyframes spin { 100% { transform: rotate(360deg); } }
+    .cell.processing { border-style: solid; border-color: #38bdf8; background: #f0f9ff; }
+    .cell.processing::before { content: ""; position: absolute; width: 28px; height: 28px; border: 3px solid #bae6fd; border-top-color: #0284c7; border-radius: 50%; animation: spin 1s linear infinite; z-index: 2; }
+    .cell.processing::after { content: "変換中..."; position: absolute; top: 50%; margin-top: 22px; font-size: 0.75rem; color: #0369a1; font-weight: 600; z-index: 2; }
+    .cell.empty::before { content: "ここにドロップ"; color: #64748b; font-size: .8rem; }
+    .preview { display: block; max-width: 100%; max-height: calc(100% - 35px); object-fit: contain; cursor: context-menu; }
+    .name { width: 100%; margin-top: 5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: center; font-size: .72rem; }
+    .remove { position: absolute; top: 5px; right: 5px; z-index: 1; width: 25px; height: 25px; border: 0; border-radius: 50%; color: #fff; background: #334155; font-size: 18px; line-height: 1; cursor: pointer; }
+    .remove:hover { background: #b91c1c; }
+    @media (max-width: 560px) { body { margin: 12px; } #grid { gap: 6px; } .cell { padding: 4px; border-radius: 5px; } }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>画像JPEG変換グリッド</h1>
+    <p class="help">JPEG/JPG・HEIF/HEIC・WebP・GIF をセルへドロップしてください。複数枚はドロップしたセルから順に配置され、既に画像があるセルは上書きされます。セルにはサムネイルを表示します。右クリックで保存される JPEG は<strong>アップロード用の画像</strong>（長辺 2048px 以下・EXIF は引き継ぎ）です。× で削除できます。GIF は先頭フレームを使用します。</p>
+    <p id="status" role="status" aria-live="polite"></p>
+    <div id="grid" aria-label="画像グリッド"></div>
+  </main>
+
+  <script>
+    (() => {
+      'use strict';
+
+      // ===== 設定 =====
+      const CELL_COUNT = 16;
+      const UPLOAD_MAX_SIDE = 2048;          // アップロード用画像の長辺の上限（これより小さい画像は拡大しない）
+      const UPLOAD_JPEG_QUALITY = 0.9;
+      const THUMB_MAX_SIDE = 512;            // 表示用。セル幅 ≒ 230 CSS px の Retina(2x) でもぼやけない大きさ
+      const THUMB_JPEG_QUALITY = 0.85;
+      const HEIC_INTERMEDIATE_QUALITY = 0.95; // heic2any 経由の一時 JPEG。後で縮小・再圧縮するので高めにする
+      const MAX_PIXELS = 100_000_000;        // デコード前にヘッダの寸法で判定する（48MP の iPhone 写真は通る）
+      const CONCURRENCY = 2;                 // 同時に変換する枚数。大きな画像のデコードでメモリが溢れるのを防ぐ
+      // pica: 縮小フィルタは既定の mks2013。仕上げに弱めのアンシャープを掛ける。
+      const RESIZE_OPTIONS = { unsharpAmount: 80, unsharpRadius: 0.6, unsharpThreshold: 2 };
+
+      // ==== BEGIN binary helpers ====
+      // DOM に依存しない純粋なバイナリ処理（JPEG / EXIF / HEIF / WebP / GIF の解析）。
+
+      const HEIF_BRANDS = new Set(['heic', 'heix', 'hevc', 'hevx', 'heim', 'heis', 'hevm', 'hevs', 'mif1', 'msf1']);
+
+      const view = (bytes) => new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+      const ascii = (bytes, start, length) => String.fromCharCode(...bytes.subarray(start, start + length));
+
+      /** 先頭バイトから形式を判定する。拡張子・MIME は信用しない。AVIF は対象外。 */
+      function detectFormat(head) {
+        const text = (offset, length) => ascii(head, offset, length);
+        if (head.length >= 3 && head[0] === 0xff && head[1] === 0xd8 && head[2] === 0xff) return 'jpeg';
+        if (text(0, 4) === 'GIF8') return 'gif';
+        if (head.length >= 12 && text(0, 4) === 'RIFF' && text(8, 4) === 'WEBP') return 'webp';
+        if (head.length >= 12 && text(4, 4) === 'ftyp') {
+          const boxSize = view(head).getUint32(0);
+          const end = Math.min(boxSize || head.length, head.length);
+          const brands = [text(8, 4)];
+          for (let p = 16; p + 4 <= end; p += 4) brands.push(text(p, 4));
+          if (brands.some((brand) => brand === 'avif' || brand === 'avis')) return null;
+          if (brands.some((brand) => HEIF_BRANDS.has(brand))) return 'heif';
+        }
+        return null;
+      }
+
+      /** JPEG のセグメントを走査し、画像サイズ(SOF)と EXIF の TIFF 部分を取り出す。 */
+      function parseJpeg(bytes) {
+        let width = 0;
+        let height = 0;
+        let tiff = null;
+        let p = 2;
+        while (p + 4 <= bytes.length) {
+          if (bytes[p] !== 0xff) { p += 1; continue; }
+          const marker = bytes[p + 1];
+          if (marker === 0xff) { p += 1; continue; }                                       // フィルバイト
+          if (marker === 0x00 || marker === 0x01 || (marker >= 0xd0 && marker <= 0xd8)) { p += 2; continue; } // 長さを持たないマーカー
+          if (marker === 0xd9 || marker === 0xda) break;                                     // EOI / SOS: ここから先は画素データ
+          const length = (bytes[p + 2] << 8) | bytes[p + 3];
+          if (length < 2 || p + 2 + length > bytes.length) break;
+          const data = p + 4;
+          if (marker === 0xe1 && !tiff && length >= 8 && ascii(bytes, data, 6) === 'Exif\0\0') {
+            tiff = bytes.slice(data + 6, p + 2 + length); // コピーして元の大きなバッファを保持しない
+          } else if (marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc && !width) {
+            height = (bytes[data + 1] << 8) | bytes[data + 2];
+            width = (bytes[data + 3] << 8) | bytes[data + 4];
+          }
+          p += 2 + length;
+        }
+        return { width, height, tiff };
+      }
+
+      function parseWebpSize(bytes) {
+        const dv = view(bytes);
+        let p = 12;
+        while (p + 8 <= bytes.length) {
+          const type = ascii(bytes, p, 4);
+          const size = dv.getUint32(p + 4, true);
+          const d = p + 8;
+          if (type === 'VP8X' && d + 10 <= bytes.length) {
+            return {
+              width: 1 + (bytes[d + 4] | (bytes[d + 5] << 8) | (bytes[d + 6] << 16)),
+              height: 1 + (bytes[d + 7] | (bytes[d + 8] << 8) | (bytes[d + 9] << 16)),
+            };
+          }
+          if (type === 'VP8 ' && d + 10 <= bytes.length && bytes[d + 3] === 0x9d && bytes[d + 4] === 0x01 && bytes[d + 5] === 0x2a) {
+            return { width: dv.getUint16(d + 6, true) & 0x3fff, height: dv.getUint16(d + 8, true) & 0x3fff };
+          }
+          if (type === 'VP8L' && d + 5 <= bytes.length && bytes[d] === 0x2f) {
+            const bits = dv.getUint32(d + 1, true);
+            return { width: (bits & 0x3fff) + 1, height: ((bits >>> 14) & 0x3fff) + 1 };
+          }
+          p = d + size + (size & 1);
+        }
+        return { width: 0, height: 0 };
+      }
+
+      function parseGifSize(bytes) {
+        if (bytes.length < 10) return { width: 0, height: 0 };
+        return { width: bytes[6] | (bytes[7] << 8), height: bytes[8] | (bytes[9] << 8) };
+      }
+
+      /**
+       * HEIF(ISO BMFF) から (1) 画像サイズ(ispe の最大値) と (2) EXIF の TIFF 部分を取り出す。
+       * HEIC を JPEG に変換するライブラリ(heic2any)は EXIF を落とすため、元ファイルから直接読む。
+       * 壊れたファイルでは例外を握りつぶし、取れた分だけ返す。
+       */
+      function parseHeif(bytes) {
+        const dv = view(bytes);
+        const result = { width: 0, height: 0, tiff: null };
+        const u16 = (p) => dv.getUint16(p);
+        const u32 = (p) => dv.getUint32(p);
+        const uint = (p, n) => {
+          if (n < 0 || n > 8 || p + n > bytes.length) throw new RangeError('out of range');
+          let value = 0;
+          for (let i = 0; i < n; i += 1) value = value * 256 + bytes[p + i];
+          return value;
+        };
+
+        function* boxes(start, end) {
+          let p = start;
+          while (p + 8 <= end) {
+            let size = u32(p);
+            const type = ascii(bytes, p + 4, 4);
+            let header = 8;
+            if (size === 1) {
+              if (p + 16 > end) return;
+              size = u32(p + 8) * 4294967296 + u32(p + 12);
+              header = 16;
+            } else if (size === 0) {
+              size = end - p;
+            }
+            if (size < header || p + size > end) return;
+            yield { type, start: p + header, end: p + size };
+            p += size;
+          }
+        }
+
+        function findExifItemId(iinf) {
+          const version = bytes[iinf.start];
+          const first = iinf.start + 4 + (version === 0 ? 2 : 4);
+          for (const infe of boxes(first, iinf.end)) {
+            if (infe.type !== 'infe') continue;
+            const v = bytes[infe.start];
+            if (v < 2) continue;
+            let q = infe.start + 4;
+            const id = v === 2 ? u16(q) : u32(q);
+            q += (v === 2 ? 2 : 4) + 2; // item_ID + protection_index
+            if (ascii(bytes, q, 4) === 'Exif') return id;
+          }
+          return -1;
+        }
+
+        function findItemExtents(iloc, itemId) {
+          const version = bytes[iloc.start];
+          let p = iloc.start + 4;
+          const offsetSize = bytes[p] >> 4;
+          const lengthSize = bytes[p] & 15;
+          p += 1;
+          const baseSize = bytes[p] >> 4;
+          const indexSize = version === 1 || version === 2 ? bytes[p] & 15 : 0;
+          p += 1;
+          const count = version < 2 ? u16(p) : u32(p);
+          p += version < 2 ? 2 : 4;
+          for (let i = 0; i < count && p < iloc.end; i += 1) {
+            const id = version < 2 ? u16(p) : u32(p);
+            p += version < 2 ? 2 : 4;
+            let method = 0;
+            if (version === 1 || version === 2) { method = u16(p) & 0x0f; p += 2; }
+            p += 2; // data_reference_index
+            const base = uint(p, baseSize);
+            p += baseSize;
+            const extentCount = u16(p);
+            p += 2;
+            const extents = [];
+            for (let j = 0; j < extentCount; j += 1) {
+              p += indexSize;
+              const offset = uint(p, offsetSize);
+              p += offsetSize;
+              const length = uint(p, lengthSize);
+              p += lengthSize;
+              extents.push({ offset: base + offset, length });
+            }
+            if (id === itemId) return { method, extents };
+          }
+          return null;
+        }
+
+        for (const top of boxes(0, bytes.length)) {
+          if (top.type !== 'meta') continue;
+          const children = [...boxes(top.start + 4, top.end)]; // meta は FullBox（先頭4バイトが version/flags）
+
+          try {
+            for (const iprp of children.filter((box) => box.type === 'iprp')) {
+              for (const ipco of boxes(iprp.start, iprp.end)) {
+                if (ipco.type !== 'ipco') continue;
+                for (const prop of boxes(ipco.start, ipco.end)) {
+                  if (prop.type !== 'ispe' || prop.end - prop.start < 12) continue;
+                  const w = u32(prop.start + 4);
+                  const h = u32(prop.start + 8);
+                  if (w * h > result.width * result.height) { result.width = w; result.height = h; }
+                }
+              }
+            }
+          } catch (_) { /* 寸法が取れなくても続行 */ }
+
+          try {
+            const iinf = children.find((box) => box.type === 'iinf');
+            const iloc = children.find((box) => box.type === 'iloc');
+            const exifId = iinf ? findExifItemId(iinf) : -1;
+            const location = iloc && exifId >= 0 ? findItemExtents(iloc, exifId) : null;
+            if (location && location.method === 0) { // 0 = ファイル先頭からのオフセット
+              const total = location.extents.reduce((sum, e) => sum + e.length, 0);
+              if (total >= 12 && total <= 4 * 1024 * 1024) {
+                const payload = new Uint8Array(total);
+                let at = 0;
+                for (const extent of location.extents) {
+                  if (extent.offset + extent.length > bytes.length) throw new RangeError('extent out of range');
+                  payload.set(bytes.subarray(extent.offset, extent.offset + extent.length), at);
+                  at += extent.length;
+                }
+                // Exif アイテムは先頭4バイトが「TIFF ヘッダまでのオフセット」
+                const start = 4 + view(payload).getUint32(0);
+                const t = payload.subarray(start);
+                const isTiff = t.length >= 8 && ((t[0] === 0x49 && t[1] === 0x49 && t[2] === 0x2a && t[3] === 0) || (t[0] === 0x4d && t[1] === 0x4d && t[2] === 0 && t[3] === 0x2a));
+                if (isTiff) result.tiff = t;
+              }
+            }
+          } catch (_) { /* EXIF が取れなくても続行 */ }
+          break;
+        }
+        return result;
+      }
+
+      function inspectImage(bytes, format) {
+        switch (format) {
+          case 'jpeg': return parseJpeg(bytes);
+          case 'heif': return parseHeif(bytes);
+          case 'webp': return { ...parseWebpSize(bytes), tiff: null };
+          case 'gif': return { ...parseGifSize(bytes), tiff: null };
+          default: return { width: 0, height: 0, tiff: null };
+        }
+      }
+
+      /**
+       * EXIF(TIFF) をコピーし、サイズに関わる項目だけを書き換える。
+       *  - Orientation(0x0112) → 1 : 向きは画素側に反映済みなので、二重回転を防ぐ
+       *  - ImageWidth/Length(0x0100/0x0101, IFD0), PixelXDimension/YDimension(0xA002/0xA003, Exif IFD) → 新しいサイズ
+       * 範囲外アクセスなどの破損は例外になる（呼び出し側で EXIF なしとして扱う）。
+       */
+      function rewriteExif(tiff, width, height) {
+        const data = tiff.slice();
+        const dv = view(data);
+        const littleEndian = data[0] === 0x49 && data[1] === 0x49;
+        if (!littleEndian && !(data[0] === 0x4d && data[1] === 0x4d)) throw new Error('bad TIFF header');
+        if (dv.getUint16(2, littleEndian) !== 42) throw new Error('bad TIFF magic');
+
+        let orientation = 1;
+        let exifIfd = 0;
+        const setSize = (entry, type, count, value) => {
+          if (count !== 1) return;
+          if (type === 3) dv.setUint16(entry + 8, value, littleEndian);
+          else if (type === 4) dv.setUint32(entry + 8, value, littleEndian);
+        };
+        const walk = (ifdOffset, visit) => {
+          const n = dv.getUint16(ifdOffset, littleEndian);
+          for (let i = 0; i < n; i += 1) {
+            const entry = ifdOffset + 2 + i * 12;
+            visit(dv.getUint16(entry, littleEndian), dv.getUint16(entry + 2, littleEndian), dv.getUint32(entry + 4, littleEndian), entry);
+          }
+        };
+
+        walk(dv.getUint32(4, littleEndian), (tag, type, count, entry) => {
+          if (tag === 0x0112 && type === 3 && count === 1) {
+            const value = dv.getUint16(entry + 8, littleEndian);
+            orientation = value >= 2 && value <= 8 ? value : 1;
+            dv.setUint16(entry + 8, 1, littleEndian);
+          } else if (tag === 0x0100) {
+            setSize(entry, type, count, width);
+          } else if (tag === 0x0101) {
+            setSize(entry, type, count, height);
+          } else if (tag === 0x8769 && type === 4) {
+            exifIfd = dv.getUint32(entry + 8, littleEndian);
+          }
+        });
+        if (exifIfd) {
+          walk(exifIfd, (tag, type, count, entry) => {
+            if (tag === 0xa002) setSize(entry, type, count, width);
+            else if (tag === 0xa003) setSize(entry, type, count, height);
+          });
+        }
+        return { tiff: data, orientation }; // orientation は書き換え前の値（1 = 回転なし）
+      }
+
+      /** JPEG Blob に EXIF(APP1) を挿入する。JFIF(APP0) があればその直後、なければ SOI の直後。 */
+      async function injectExif(jpegBlob, tiff) {
+        const segmentLength = tiff.length + 8; // 長さ欄(2) + "Exif\0\0"(6) + TIFF
+        if (segmentLength > 0xffff) throw new Error('EXIF が大きすぎて APP1 に収まりません');
+        const head = new Uint8Array(await jpegBlob.slice(0, 20).arrayBuffer());
+        if (head[0] !== 0xff || head[1] !== 0xd8) throw new Error('JPEG ではありません');
+        const insertAt = head[2] === 0xff && head[3] === 0xe0 ? 4 + ((head[4] << 8) | head[5]) : 2;
+        const app1Header = new Uint8Array([0xff, 0xe1, segmentLength >> 8, segmentLength & 0xff, 0x45, 0x78, 0x69, 0x66, 0, 0]);
+        return new Blob([jpegBlob.slice(0, insertAt), app1Header, tiff, jpegBlob.slice(insertAt)], { type: 'image/jpeg' });
+      }
+
+      /** 長辺が max を超えるときだけ縮小したサイズを返す。拡大はしない。 */
+      function fitWithin(width, height, max) {
+        const scale = Math.min(1, max / Math.max(width, height));
+        if (scale === 1) return { width, height, scaled: false };
+        return { width: Math.max(1, Math.round(width * scale)), height: Math.max(1, Math.round(height * scale)), scaled: true };
+      }
+      // ==== END binary helpers ====
+
+      // ===== 状態 =====
+      const grid = document.getElementById('grid');
+      const statusEl = document.getElementById('status');
+      const cells = [];
+      const dragDepth = new Array(CELL_COUNT).fill(0);
+      // 各セルの状態。generation は、古い非同期処理が新しい結果を上書きするのを防ぐ世代番号。
+      // 次段階のサーバー送信は uploadBlob（と uploadName）をここから取り出せばよい。
+      const records = Array.from({ length: CELL_COUNT }, () => ({ thumbUrl: null, uploadBlob: null, uploadName: '', generation: 0 }));
+
+      // defer 指定のライブラリが読み終わる（または失敗する）まで待つ。
+      const librariesReady = document.readyState === 'complete'
+        ? Promise.resolve()
+        : new Promise((resolve) => window.addEventListener('load', resolve, { once: true }));
+
+      let picaInstance = null;
+      function getPica() {
+        if (typeof window.pica !== 'function') {
+          throw new Error('リサイズ用ライブラリ（pica）を読み込めませんでした。ネットワーク接続を確認してください。');
+        }
+        picaInstance = picaInstance || window.pica();
+        return picaInstance;
+      }
+
+      // 変換の同時実行数を全ドロップ合計で制限する簡易セマフォ。
+      let running = 0;
+      const waiting = [];
+      function limit(task) {
+        return new Promise((resolve, reject) => {
+          const start = () => {
+            running += 1;
+            task().then(resolve, reject).finally(() => {
+              running -= 1;
+              const next = waiting.shift();
+              if (next) next();
+            });
+          };
+          if (running < CONCURRENCY) start(); else waiting.push(start);
+        });
+      }
+
+      // ===== 小さなユーティリティ =====
+      function setStatus(message, isError = false) {
+        statusEl.textContent = message;
+        statusEl.classList.toggle('error', isError);
+      }
+
+      function jpegFileName(name) {
+        const dot = name.lastIndexOf('.');
+        const base = dot > 0 ? name.slice(0, dot) : name;
+        return `${base || 'image'}.jpg`;
+      }
+
+      function formatBytes(size) {
+        return size < 1024 * 1024 ? `${Math.max(1, Math.round(size / 1024))} KB` : `${(size / 1024 / 1024).toFixed(1)} MB`;
+      }
+
+      function releaseCanvas(canvas) {
+        if (canvas) { canvas.width = 0; canvas.height = 0; } // 大きなバッファを早めに手放す
+      }
+
+      function pixelLimitError() {
+        return new Error(`画像の画素数が上限（${MAX_PIXELS.toLocaleString()}画素）を超えています。`);
+      }
+
+      function describeError(error) {
+        if (error && error.name === 'InvalidStateError') return '画像をデコードできませんでした（破損しているか、未対応の形式です）。';
+        return (error && error.message) || (typeof error === 'string' ? error : '変換に失敗しました。');
+      }
+
+      // ===== 画像処理 =====
+      async function createBitmap(blob) {
+        try {
+          // from-image: EXIF の向きを画素に反映する。
+          return await createImageBitmap(blob, { imageOrientation: 'from-image' });
+        } catch (error) {
+          // このオプションを知らないブラウザは TypeError になる。その場合は既定の挙動（向きを反映）に任せる。
+          // 本当のデコード失敗（InvalidStateError など）はそのまま投げ、二重にデコードしない。
+          if (!(error instanceof TypeError)) throw error;
+          return createImageBitmap(blob);
+        }
+      }
+
+      async function decodeImage(file, format) {
+        if (format === 'heif') {
+          try {
+            // Safari など HEIC をネイティブに読めるブラウザでは、そのまま読む（一時 JPEG を経由しないので劣化しない）。
+            return await createBitmap(file);
+          } catch (_) { /* 読めない環境は heic2any へ */ }
+          if (typeof window.heic2any !== 'function') {
+            throw new Error('HEIF/HEIC 変換ライブラリを読み込めませんでした。ネットワーク接続を確認してください。');
+          }
+          const converted = await window.heic2any({ blob: file, toType: 'image/jpeg', quality: HEIC_INTERMEDIATE_QUALITY });
+          return createBitmap(Array.isArray(converted) ? converted[0] : converted);
+        }
+        return createBitmap(file);
+      }
+
+      /**
+       * ImageBitmap を白背景の canvas に描く。
+       *  - JPEG は透明を持てないので、透明部分（GIF/WebP など）は白で合成する。
+       *  - pica に ImageBitmap を直接渡すと、環境によってタイルの切り出し位置が狂い、画像が崩れることがある
+       *    （Chromium で実際に再現。縦長画像で顕著）。pica が本来想定している canvas 入力にしておく。
+       */
+      function drawOnWhiteCanvas(bitmap) {
+        const canvas = document.createElement('canvas');
+        canvas.width = bitmap.width;
+        canvas.height = bitmap.height;
+        const context = canvas.getContext('2d');
+        if (!context) throw new Error('Canvas 2D を初期化できませんでした。');
+        context.fillStyle = '#ffffff';
+        context.fillRect(0, 0, canvas.width, canvas.height);
+        context.drawImage(bitmap, 0, 0);
+        return canvas;
+      }
+
+      /** source(canvas) を width×height の canvas に縮小する。縮小は pica、等倍なら単純コピー。 */
+      async function resizeToCanvas(source, width, height) {
+        const target = document.createElement('canvas');
+        target.width = width;
+        target.height = height;
+        if (source.width === width && source.height === height) {
+          const context = target.getContext('2d');
+          if (!context) throw new Error('Canvas 2D を初期化できませんでした。');
+          context.fillStyle = '#ffffff';
+          context.fillRect(0, 0, width, height);
+          context.drawImage(source, 0, 0);
+        } else {
+          await getPica().resize(source, target, RESIZE_OPTIONS);
+        }
+        return target;
+      }
+
+      function canvasToJpegBlob(canvas, quality) {
+        return new Promise((resolve, reject) => {
+          canvas.toBlob((blob) => {
+            if (blob) resolve(blob); else reject(new Error('JPEG Blob を作成できませんでした。'));
+          }, 'image/jpeg', quality);
+        });
+      }
+
+      // 大きなファイルの全バイトはこの関数の中だけで保持し、必要な情報だけ返して解放する。
+      async function readInfo(file, format) {
+        return inspectImage(new Uint8Array(await file.arrayBuffer()), format);
+      }
+
+      /**
+       * 1ファイルから { thumbBlob, uploadBlob } を作る。
+       *  - uploadBlob: 長辺 2048px 以下の JPEG。サイズ以外のメタデータ(EXIF)は引き継ぐ。
+       *  - thumbBlob : セル表示用の縮小 JPEG（EXIF なし）。
+       */
+      async function buildImages(file, format) {
+        const info = await readInfo(file, format);
+        // デコードする前に、ヘッダの寸法で巨大画像を弾く。
+        if (info.width && info.height && info.width * info.height > MAX_PIXELS) throw pixelLimitError();
+
+        await librariesReady;
+        const bitmap = await decodeImage(file, format);
+        let source = null;
+        let uploadCanvas = null;
+        let thumbCanvas = null;
+        try {
+          const srcWidth = bitmap.width;
+          const srcHeight = bitmap.height;
+          if (!srcWidth || !srcHeight || srcWidth * srcHeight > MAX_PIXELS) throw pixelLimitError();
+
+          source = drawOnWhiteCanvas(bitmap);
+          bitmap.close(); // 原寸のビットマップを早めに手放す（以降は source の canvas だけを使う）
+
+          const target = fitWithin(srcWidth, srcHeight, UPLOAD_MAX_SIDE);
+          const warnings = [];
+
+          // EXIF: 向きは画素に反映済みなので Orientation を 1 にし、寸法を新しいサイズに更新する。
+          let exif = null;
+          if (info.tiff) {
+            try {
+              exif = rewriteExif(info.tiff, target.width, target.height);
+            } catch (error) {
+              console.warn('EXIF の解析に失敗:', error);
+              warnings.push('EXIF を引き継げませんでした');
+            }
+          }
+
+          // 縮小が不要で、向きの補正も要らない JPEG は、元のバイト列をそのまま使う（再圧縮による劣化なし・全メタデータ保持）。
+          const passThrough = format === 'jpeg' && !target.scaled && (!info.tiff || (exif && exif.orientation === 1));
+
+          let uploadBlob;
+          if (passThrough) {
+            uploadBlob = file.type === 'image/jpeg' ? file : file.slice(0, file.size, 'image/jpeg');
+          } else {
+            uploadCanvas = await resizeToCanvas(source, target.width, target.height);
+            uploadBlob = await canvasToJpegBlob(uploadCanvas, UPLOAD_JPEG_QUALITY);
+            if (exif) {
+              try {
+                uploadBlob = await injectExif(uploadBlob, exif.tiff);
+              } catch (error) {
+                console.warn('EXIF の挿入に失敗:', error);
+                warnings.push('EXIF を引き継げませんでした');
+              }
+            }
+          }
+
+          // サムネイルは（あれば）縮小済みのアップロード用画像から作る。原寸から作るより速い。
+          const thumbSource = uploadCanvas || source;
+          const thumbSize = fitWithin(thumbSource.width, thumbSource.height, THUMB_MAX_SIDE);
+          thumbCanvas = await resizeToCanvas(thumbSource, thumbSize.width, thumbSize.height);
+          const thumbBlob = await canvasToJpegBlob(thumbCanvas, THUMB_JPEG_QUALITY);
+
+          return { thumbBlob, uploadBlob, width: target.width, height: target.height, warnings };
+        } finally {
+          bitmap.close();
+          releaseCanvas(source);
+          releaseCanvas(uploadCanvas);
+          releaseCanvas(thumbCanvas);
+        }
+      }
+
+      // ===== セルの表示 =====
+      function revokeThumb(index) {
+        const record = records[index];
+        if (record.thumbUrl) {
+          URL.revokeObjectURL(record.thumbUrl);
+          record.thumbUrl = null;
+        }
+      }
+
+      function clearCell(index) {
+        const record = records[index];
+        record.generation += 1;
+        revokeThumb(index);
+        record.uploadBlob = null;
+        record.uploadName = '';
+        const cell = cells[index];
+        cell.replaceChildren();
+        cell.classList.remove('processing');
+        cell.classList.add('empty');
+      }
+
+      /** アップロード用と同じ JPEG を保存する。 */
+      function saveUploadImage(index) {
+        const { uploadBlob, uploadName } = records[index];
+        if (!uploadBlob) return;
+        const url = URL.createObjectURL(uploadBlob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = uploadName;
+        document.body.append(link); // Firefox 向け
+        link.click();
+        link.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 60_000);
+      }
+
+      function showImage(index, result, sourceName, generation) {
+        // 同じセルに、より新しいドロップやクリアがあった場合は、この結果を捨てる。
+        if (records[index].generation !== generation) return false;
+
+        const cell = cells[index];
+        const thumbUrl = URL.createObjectURL(result.thumbBlob);
+        revokeThumb(index);
+        Object.assign(records[index], { thumbUrl, uploadBlob: result.uploadBlob, uploadName: jpegFileName(sourceName) });
+        cell.replaceChildren();
+        cell.classList.remove('empty', 'processing');
+
+        const image = document.createElement('img');
+        image.className = 'preview';
+        image.src = thumbUrl;
+        image.alt = sourceName;
+        image.title = `右クリックでJPEGを保存（${result.width}×${result.height}px・${formatBytes(result.uploadBlob.size)}）`;
+        image.addEventListener('contextmenu', (event) => {
+          event.preventDefault();
+          saveUploadImage(index);
+        });
+        image.addEventListener('error', () => {
+          if (records[index].thumbUrl === thumbUrl) clearCell(index);
+          setStatus(`${sourceName} を表示できませんでした。`, true);
+        }, { once: true });
+
+        const name = document.createElement('span');
+        name.className = 'name';
+        name.textContent = sourceName;
+        name.title = sourceName;
+
+        const remove = document.createElement('button');
+        remove.className = 'remove';
+        remove.type = 'button';
+        remove.title = '画像を削除';
+        remove.setAttribute('aria-label', `${sourceName} を削除`);
+        remove.textContent = '×';
+        remove.addEventListener('click', () => clearCell(index));
+        cell.append(image, name, remove);
+        return true;
+      }
+
+      // ===== ドロップ処理 =====
+      async function sniffFormat(file) {
+        try {
+          return detectFormat(new Uint8Array(await file.slice(0, 64).arrayBuffer()));
+        } catch (_) {
+          return null; // フォルダなど読めないもの
+        }
+      }
+
+      function placeFile(file, format, index, generation) {
+        return limit(async () => {
+          // 順番待ちの間に上書き・削除されていたら、重い処理を始めない。
+          if (records[index].generation !== generation) return { superseded: true };
+          try {
+            const result = await buildImages(file, format);
+            return showImage(index, result, file.name, generation)
+              ? { ok: true, warnings: result.warnings }
+              : { superseded: true };
+          } catch (error) {
+            console.error('Image conversion failed:', file.name, error);
+            if (records[index].generation !== generation) return { superseded: true };
+            cells[index].classList.remove('processing'); // 変換失敗時は、以前から表示中の画像を残す
+            return { failed: true, message: `${file.name}: ${describeError(error)}` };
+          }
+        });
+      }
+
+      async function handleDrop(event, startIndex) {
+        event.preventDefault();
+        dragDepth[startIndex] = 0;
+        cells[startIndex].classList.remove('dragover');
+        const dropped = Array.from(event.dataTransfer.files || []); // await の前に取り出しておく
+        if (!dropped.length) return;
+
+        setStatus('ファイルを確認しています…');
+        const formats = await Promise.all(dropped.map(sniffFormat));
+        const accepted = dropped.map((file, i) => ({ file, format: formats[i] })).filter((item) => item.format);
+        const rejectedTypeCount = dropped.length - accepted.length;
+        const capacity = CELL_COUNT - startIndex;
+        const toPlace = accepted.slice(0, capacity);
+        const overflowCount = accepted.length - toPlace.length;
+
+        if (!toPlace.length) {
+          setStatus('対応している画像ファイル（JPEG / HEIF / WebP / GIF）がありません。', true);
+          return;
+        }
+
+        const total = toPlace.length;
+        let finished = 0;
+        setStatus(`変換中… 0 / ${total}`);
+        const results = await Promise.all(toPlace.map(({ file, format }, offset) => {
+          const index = startIndex + offset;
+          const generation = ++records[index].generation;
+          
+          // 【修正】emptyクラスを外し、processingクラスを付与することで表示の重複を防ぐ
+          cells[index].classList.remove('empty');
+          cells[index].classList.add('processing');
+          
+          return placeFile(file, format, index, generation).then((result) => {
+            finished += 1;
+            if (finished < total) setStatus(`変換中… ${finished} / ${total}`);
+            return result;
+          });
+        }));
+
+        const succeeded = results.filter((r) => r.ok).length;
+        const failures = results.filter((r) => r.failed);
+        const warned = results.filter((r) => r.ok && r.warnings.length).length;
+        const summary = [];
+        if (succeeded) summary.push(`${succeeded} 枚を変換しました。`);
+        if (failures.length) summary.push(`${failures.length} 枚は変換できませんでした。`);
+        if (warned) summary.push(`${warned} 枚は EXIF を引き継げませんでした。`);
+        if (overflowCount) summary.push(`ドロップ位置から先の空き枠を超えた ${overflowCount} 枚は受け付けませんでした。`);
+        if (rejectedTypeCount) summary.push(`${rejectedTypeCount} 枚は対応形式ではないため受け付けませんでした。`);
+        const lines = [summary.join(' ')].filter(Boolean);
+        failures.slice(0, 3).forEach((failure) => lines.push(failure.message));
+        setStatus(lines.join('\n'), failures.length > 0 || warned > 0 || overflowCount > 0 || rejectedTypeCount > 0);
+      }
+
+      // ===== 初期化 =====
+      for (let index = 0; index < CELL_COUNT; index += 1) {
+        const cell = document.createElement('div');
+        cell.className = 'cell empty';
+        cell.dataset.index = String(index);
+        cell.setAttribute('aria-label', `画像セル ${index + 1}`);
+        cell.addEventListener('dragover', (event) => {
+          event.preventDefault();
+          event.dataTransfer.dropEffect = 'copy';
+        });
+        // 子要素（img など）に出入りするたびに dragenter/dragleave が飛ぶので、深さを数えてハイライトを制御する。
+        cell.addEventListener('dragenter', (event) => {
+          event.preventDefault();
+          dragDepth[index] += 1;
+          cell.classList.add('dragover');
+        });
+        cell.addEventListener('dragleave', () => {
+          dragDepth[index] = Math.max(0, dragDepth[index] - 1);
+          if (dragDepth[index] === 0) cell.classList.remove('dragover');
+        });
+        cell.addEventListener('drop', (event) => handleDrop(event, index));
+        cells.push(cell);
+        grid.append(cell);
+      }
+
+      // セルの外にファイルを落としても、ブラウザがそのファイルを開いてページ遷移（＝状態の消失）しないようにする。
+      window.addEventListener('dragover', (event) => {
+        event.preventDefault();
+        if (!(event.target instanceof Element) || !event.target.closest('.cell')) event.dataTransfer.dropEffect = 'none';
+      });
+      window.addEventListener('drop', (event) => event.preventDefault());
+    })();
+  </script>
+  <small>&copy; 2026 apsidyne/hashitom.com</small>
+</body>
+</html>
