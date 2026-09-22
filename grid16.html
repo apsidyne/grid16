@@ -438,7 +438,7 @@
             throw new Error('HEIF/HEIC 変換ライブラリを読み込めませんでした。ネットワーク接続を確認してください。');
           }
           const converted = await window.HeicTo({ blob: file, toType: 'image/jpeg', quality: HEIC_INTERMEDIATE_QUALITY });
-          return createBitmap(Array.isArray(converted);
+          return createBitmap(converted);
         }
         return createBitmap(file);
       }
