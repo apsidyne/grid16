@@ -6,7 +6,7 @@
   <title>画像グリッド</title>
 
   <script defer src="https://cdn.jsdelivr.net/npm/pica@9.0.1/dist/pica.min.js" integrity="sha384-erKD4aAW95PJjutWX+eFrsIh9Kl6k9mLJ89rDrWhF2/EvCdxqe2aR5tDaI4SIFl/" crossorigin="anonymous"></script>
-  <script defer src="https://cdn.jsdelivr.net/npm/heic2any@0.0.4/dist/heic2any.min.js" integrity="sha384-OTofQ0MEeiSgh62havBcemCIK0gqj809wX6UA0uPISNMRnR6NZyCdGzX3SbLrgwL" crossorigin="anonymous"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/heic-to@1.5.2/dist/iife/heic-to.js" integrity="sha384-cVm8gaWQ5+URpoh6ACKXpm8TuyoHkfIDDBkxvDoUdIZ18w8nV5en0lVQvWMwO/6S" crossorigin="anonymous"></script>
   <style>
     :root { color-scheme: light; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
     body { margin: 24px; color: #1f2937; background: #f8fafc; }
@@ -48,7 +48,7 @@
       const UPLOAD_JPEG_QUALITY = 0.9;
       const THUMB_MAX_SIDE = 512;            // 表示用。セル幅 ≒ 230 CSS px の Retina(2x) でもぼやけない大きさ
       const THUMB_JPEG_QUALITY = 0.85;
-      const HEIC_INTERMEDIATE_QUALITY = 0.95; // heic2any 経由の一時 JPEG。後で縮小・再圧縮するので高めにする
+      const HEIC_INTERMEDIATE_QUALITY = 0.95; // heic-to 経由の一時 JPEG。後で縮小・再圧縮するので高めにする
       const MAX_PIXELS = 100_000_000;        // デコード前にヘッダの寸法で判定する（48MP の iPhone 写真は通る）
       const CONCURRENCY = 2;                 // 同時に変換する枚数。大きな画像のデコードでメモリが溢れるのを防ぐ
       // pica: 縮小フィルタは既定の mks2013。仕上げに弱めのアンシャープを掛ける。
@@ -137,7 +137,7 @@
 
       /**
        * HEIF(ISO BMFF) から (1) 画像サイズ(ispe の最大値) と (2) EXIF の TIFF 部分を取り出す。
-       * HEIC を JPEG に変換するライブラリ(heic2any)は EXIF を落とすため、元ファイルから直接読む。
+       * HEIC を JPEG に変換するライブラリ(heic-to)は EXIF を落とすため、元ファイルから直接読む。
        * 壊れたファイルでは例外を握りつぶし、取れた分だけ返す。
        */
       function parseHeif(bytes) {
@@ -433,12 +433,12 @@
           try {
             // Safari など HEIC をネイティブに読めるブラウザでは、そのまま読む（一時 JPEG を経由しないので劣化しない）。
             return await createBitmap(file);
-          } catch (_) { /* 読めない環境は heic2any へ */ }
-          if (typeof window.heic2any !== 'function') {
+          } catch (_) { /* 読めない環境は heic-to へ */ }
+          if (typeof window.HeicTo !== 'function') {
             throw new Error('HEIF/HEIC 変換ライブラリを読み込めませんでした。ネットワーク接続を確認してください。');
           }
-          const converted = await window.heic2any({ blob: file, toType: 'image/jpeg', quality: HEIC_INTERMEDIATE_QUALITY });
-          return createBitmap(Array.isArray(converted) ? converted[0] : converted);
+          const converted = await window.HeicTo({ blob: file, toType: 'image/jpeg', quality: HEIC_INTERMEDIATE_QUALITY });
+          return createBitmap(Array.isArray(converted);
         }
         return createBitmap(file);
       }
@@ -750,6 +750,6 @@
       window.addEventListener('drop', (event) => event.preventDefault());
     })();
   </script>
-  <small>&copy; 2026 apsidyne/hashitom.com</small>
+  <small>2026 apsidyne/hashitom.com</small>
 </body>
 </html>
